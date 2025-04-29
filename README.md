@@ -2,8 +2,6 @@
 
 This is a real-time ADC sample capture and processing tool to obtain and analyze raw data from TI mmWave radar ***XWR1843 EVM*** cascading with ***DCA1000 EVM*** using Python. The tool enables real-time processing to generate Range Profile, Range-Doppler, and Range-Angle images under 1 Transmitter and 4 Receiver (in this version) setting without using mmWave studio.
 
-![Demo](Demo.PNG)
-
 ## Table of Contents
 - [Hardware Requirements](#hardware-requirements)
 - [Software Requirements](#software-requirements)
@@ -15,9 +13,7 @@ This is a real-time ADC sample capture and processing tool to obtain and analyze
 - [Troubleshooting](#troubleshooting)
 - [Project Structure](#project-structure)
 - [Features and Capabilities](#features-and-capabilities)
-- [Contact](#contact)
-- [Acknowledgement](#acknowledgement)
-- [Citation](#citation)
+
 
 ## Hardware Requirements
 
@@ -273,28 +269,8 @@ The project is organized into three main components:
 * Channel selection for detailed analysis
 * Configuration file management
 
-## Contact
-* Jih-Tsun Yu E-mail: t108368020@ntut.org.tw
-* Jyun-Jhih Lin E-mail: t109368038@ntut.org.tw
 
-## Acknowledgement
-Thanks for TI, TI's e2e forum, and other people work on mmWave Radar make this happen.
-Also grateful for the help from Mr. Chieh-Hsun Hsieh
 
-## Citation
-
-The tool is related to the real-time prototyping of the following paper:
-
-J. Yu, L. Yen and P. Tseng, "mmWave Radar-based Hand Gesture Recognition using Range-Angle Image," 2020 IEEE 91st Vehicular Technology Conference (VTC2020-Spring), Antwerp, Belgium, 2020, pp. 1-5, doi: 10.1109/VTC2020-Spring48590.2020.9128573.
-
-**BibTex Form**
-```
-@INPROCEEDINGS{9128573,
-  author={J. {Yu} and L. {Yen} and P. {Tseng}},
-  booktitle={2020 IEEE 91st Vehicular Technology Conference (VTC2020-Spring)}, 
-  title={mmWave Radar-based Hand Gesture Recognition using Range-Angle Image}, 
-  year={2020},
-  pages={1-5},
   doi={10.1109/VTC2020-Spring48590.2020.9128573}
 }
 ```
