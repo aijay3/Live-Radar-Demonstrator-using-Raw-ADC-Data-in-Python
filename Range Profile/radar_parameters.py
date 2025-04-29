@@ -1,5 +1,6 @@
 import math
 import re
+import logging
 
 class RadarParameters:
     # Physical constants
@@ -8,6 +9,16 @@ class RadarParameters:
     def __init__(self, config_file_path):
         self.config_file_path = config_file_path
         self.config_params = self._parse_config_file()
+        # Range offset calibration parameter (in meters)
+        # Negative value means objects are displayed farther than they actually are
+        # Positive value means objects are displayed closer than they actually are
+        # For example, if an object at 1m is displayed at 2m, use -1.0 to correct it
+        self.range_offset = -1.0
+        # Base range padding size for calibration (default is 256)
+        # This is used to scale the range offset when different padding sizes are used
+        self.base_range_padding = 256
+        # Flag to indicate if range offset should be automatically adjusted based on padding
+        self.auto_adjust_offset = True
         
     def _parse_config_file(self):
         """Parse the mmWave config file to extract parameters."""
@@ -57,7 +68,13 @@ class RadarParameters:
                 config_params['ramp_end_time'] = float(param_values[5])  # μs
                 config_params['tx_power'] = int(param_values[6])
                 config_params['tx_phase'] = int(param_values[7])
-                config_params['freq_slope'] = float(param_values[8])  # MHz/μs
+                # Ensure frequency slope is properly parsed as float
+                freq_slope = float(param_values[8])
+                if freq_slope == 0:
+                    logging.error("Invalid frequency slope value: 0")
+                    raise ValueError("Frequency slope cannot be 0")
+                config_params['freq_slope'] = freq_slope  # MHz/μs
+                logging.info(f"Parsed frequency slope: {freq_slope} MHz/μs")
                 config_params['tx_start_time'] = float(param_values[9])  # μs
                 config_params['adc_samples'] = int(param_values[10])
                 config_params['sample_rate'] = float(param_values[11])  # ksps
@@ -83,7 +100,7 @@ class RadarParameters:
                 })
                 
             elif config_line.startswith('frameCfg'):
-                # frameCfg <chirpStartIdx> <chirpEndIdx> <numLoops> <numFrames> 
+                # frameCfg <StartIdx> <chirpEndIdx> <numLoops> <numFrames> 
                 # <framePeriodicity> <triggerSelect> <frameTriggerDelay>
                 param_values = config_line.split()
                 config_params['chirp_start_idx'] = int(param_values[1])
@@ -113,6 +130,15 @@ class RadarParameters:
         # Calculate derived parameters
         config_params['chirps_per_frame'] = config_params['chirp_end_idx'] - config_params['chirp_start_idx'] + 1
         
+        # Log key parameters
+        logging.info("Radar Configuration Parameters:")
+        logging.info(f"  Start Frequency: {config_params['start_freq']:.4f} GHz")
+        logging.info(f"  Frequency Slope: {config_params['freq_slope']:.4f} MHz/μs")
+        logging.info(f"  Ramp End Time: {config_params['ramp_end_time']:.4f} μs")
+        logging.info(f"  Sample Rate: {config_params['sample_rate']:.4f} ksps")
+        logging.info(f"  ADC Samples: {config_params['adc_samples']}")
+        logging.info(f"  Number of Loops: {config_params['num_loops']}")
+        
         return config_params
 
     @property
@@ -132,18 +158,19 @@ class RadarParameters:
 
     @property
     def adc_sampling_time(self):
-        """ADC Sampling Time = (NADCSamples / fadc) × sec to usec"""
+        """ADC Sampling Time = (NADCSamples / (fadc * KHz2Hz)) * sec2usec"""
         if 'adc_samples' not in self.config_params or 'sample_rate' not in self.config_params:
             return 0
-        return (self.config_params['adc_samples'] / self.config_params['sample_rate']) * 1000  # μs
+        KHz2Hz = 1e3
+        sec2usec = 1e6
+        return (self.config_params['adc_samples'] / (self.config_params['sample_rate'] * KHz2Hz)) * sec2usec  # μs
 
     @property
     def inter_chirp_time(self):
         """Inter-Chirp Time = Tid + (Tramp end - Tadc)"""
         if not all(key in self.config_params for key in ['idle_time', 'ramp_end_time']):
             return 0
-        return (self.config_params['idle_time'] + 
-                (self.config_params['ramp_end_time'] - self.adc_sampling_time))  # μs
+        return self.config_params['idle_time'] + (self.config_params['ramp_end_time'] - self.adc_sampling_time)  # μs
 
     @property
     def active_frame_time(self):
@@ -168,58 +195,90 @@ class RadarParameters:
 
     @property
     def total_bandwidth(self):
-        """Total Bandwidth = Tramp end × Sslope"""
+        """Total Bandwidth = Tramp end × Sslope (in MHz)"""
         if not all(key in self.config_params for key in ['ramp_end_time', 'freq_slope']):
             return 0
-        return self.config_params['ramp_end_time'] * self.config_params['freq_slope']  # MHz
+        return self.config_params['freq_slope'] * self.config_params['ramp_end_time']  # MHz
 
     @property
     def valid_bandwidth(self):
-        """Valid Bandwidth = Tadc × Sslope"""
-        if 'freq_slope' not in self.config_params:
+        """Valid Bandwidth = Tadc × Sslope (in MHz)"""
+        if not all(key in self.config_params for key in ['freq_slope']):
             return 0
-        return self.adc_sampling_time * self.config_params['freq_slope']  # MHz
+        return self.config_params['freq_slope'] * self.adc_sampling_time  # MHz
 
     @property
     def range_resolution(self):
-        """Range Resolution = c / (2 × Bvalid)"""
+        """Range Resolution = c / (2 × B), where B is valid bandwidth in Hz"""
         if self.valid_bandwidth == 0:
             return 0
-        return self.SPEED_OF_LIGHT / (2 * self.valid_bandwidth * 1e6)  # meters
+        MHz2Hz = 1e6
+        bandwidth_hz = self.valid_bandwidth * MHz2Hz
+        resolution = self.SPEED_OF_LIGHT / (2 * bandwidth_hz)  # meters
+        #logging.info(f"Range Resolution: {resolution:.4f} meters")
+        return resolution
 
     @property
     def max_range(self):
-        """Maximum Range = (0.8 × fadc × c) / (2 × Sslope)"""
+        """Maximum Range = (IFmax × c) / (2 × S), where IFmax = 0.8 × fs for complex 1x"""
         if not all(key in self.config_params for key in ['sample_rate', 'freq_slope']):
             return 0
-        return (0.8 * self.config_params['sample_rate'] * 1000 * self.SPEED_OF_LIGHT) / (2 * self.config_params['freq_slope'] * 1e6)  # meters
+        
+        # Convert sampling rate from ksps to Hz
+        fs_hz = self.config_params['sample_rate'] * 1e3
+        
+        # Convert frequency slope from MHz/μs to Hz/s
+        # MHz/μs -> Hz/s: × 1e6 (MHz to Hz) × 1e6 (μs to s)
+        slope_hz_per_sec = self.config_params['freq_slope'] * 1e12
+        
+        # IFmax = 0.8 × fs for complex 1x mode
+        IFmax = 0.8 * fs_hz
+        
+        # Calculate maximum range
+        max_range = (IFmax * self.SPEED_OF_LIGHT) / (2 * slope_hz_per_sec)  # meters
+        #logging.info(f"Maximum Range: {max_range:.4f} meters")
+        return max_range
 
     @property
     def wavelength(self):
         """Wavelength = c / fcarrier"""
         if 'start_freq' not in self.config_params:
             return 0
-        return self.SPEED_OF_LIGHT / (self.config_params['start_freq'] * 1e9)  # meters
+        wavelength = self.SPEED_OF_LIGHT / (self.config_params['start_freq'] * 1e9)  # meters
+        logging.info(f"Wavelength: {wavelength:.4f} meters")
+        return wavelength
 
     @property
     def velocity_resolution(self):
-        """Velocity Resolution = λ / (2 × Nloops × NTX × (Tid + Tramp end))"""
+        """Velocity Resolution = λ / (2 × Nloops × numTX × Tchirp)"""
         if not all(key in self.config_params for key in ['num_loops', 'idle_time', 'ramp_end_time']):
             return 0
-        if self.num_tx_channels == 0:
-            return 0
-        return self.wavelength / (2 * self.config_params['num_loops'] * self.num_tx_channels * 
-                                (self.config_params['idle_time'] + self.config_params['ramp_end_time']) * 1e-6)  # m/s
+        sec2usec = 1e6
+        GHz2Hz = 1e9
+        # Calculate carrier frequency (using start frequency)
+        carrier_freq = self.config_params['start_freq'] * GHz2Hz
+        wavelength = self.SPEED_OF_LIGHT / carrier_freq
+        # Calculate chirp time in seconds
+        chirp_time = (self.config_params['idle_time'] + self.config_params['ramp_end_time']) / sec2usec
+        resolution = wavelength / (2 * self.config_params['num_loops'] * self.num_tx_channels * chirp_time)  # m/s
+        logging.info(f"Velocity Resolution: {resolution:.4f} m/s")
+        return resolution
 
     @property
     def max_velocity(self):
-        """Maximum Velocity = λ / (4 × NTX × (Tid + Tramp end))"""
+        """Maximum Velocity = λ / (4 × numTX × Tchirp)"""
         if not all(key in self.config_params for key in ['idle_time', 'ramp_end_time']):
             return 0
-        if self.num_tx_channels == 0:
-            return 0
-        return self.wavelength / (4 * self.num_tx_channels * 
-                                (self.config_params['idle_time'] + self.config_params['ramp_end_time']) * 1e-6)  # m/s
+        sec2usec = 1e6
+        GHz2Hz = 1e9
+        # Calculate carrier frequency (using start frequency)
+        carrier_freq = self.config_params['start_freq'] * GHz2Hz
+        wavelength = self.SPEED_OF_LIGHT / carrier_freq
+        # Calculate chirp time in seconds
+        chirp_time = (self.config_params['idle_time'] + self.config_params['ramp_end_time']) / sec2usec
+        max_vel = wavelength / (4 * self.num_tx_channels * chirp_time)  # m/s
+        logging.info(f"Maximum Velocity: {max_vel:.4f} m/s")
+        return max_vel
 
     @property
     def num_doppler_bins(self):
@@ -237,12 +296,11 @@ class RadarParameters:
 
     @property
     def radar_cube_size(self):
-        """Radar Cube Size (KB) = (2 × NADCSamples × Nchirps × Nloops × NRX) / 1024"""
+        """Radar Cube Size (KB) = (bytesPerSample × NADCSamples × Nchirps × Nloops × NRX) / 1024"""
         if not all(key in self.config_params for key in ['adc_samples', 'chirps_per_frame', 'num_loops']):
             return 0
-        # Account for complex vs real data
-        data_multiplier = 2 if self.is_complex_output else 1
-        return (data_multiplier * self.config_params['adc_samples'] * self.config_params['chirps_per_frame'] * 
+        bytes_per_sample = 4  # Complex data uses 4 bytes per sample (2 bytes each for I and Q)
+        return (bytes_per_sample * self.config_params['adc_samples'] * self.config_params['chirps_per_frame'] * 
                 self.config_params['num_loops'] * self.num_rx_channels) / 1024  # KB
 
     def get_all_parameters(self):

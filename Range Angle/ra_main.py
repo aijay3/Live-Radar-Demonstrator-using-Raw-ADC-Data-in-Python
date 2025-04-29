@@ -2,13 +2,14 @@
 Main application module for real-time radar visualization.
 """
 
-from real_time_process import UdpListener, DataProcessor
+from matplotlib import pyplot as plt
+from ra_real_time_process import UdpListener, DataProcessor
 from radar_config import SerialConfig
 from radar_parameters import RadarParameters
-from dsp import calculate_range_profile
-from queue import Queue
+from queue import Queue, Empty
 import pyqtgraph as pg
-import pyqtgraph.ptime as ptime
+# Enable OpenGL acceleration for better performance
+pg.setConfigOptions(useOpenGL=True, antialias=True)
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 import numpy as np  
 import threading
@@ -17,10 +18,11 @@ import sys
 import socket
 import logging
 from typing import Optional, List, Tuple
-from app_layout import Ui_MainWindow
+from ra_app_layout import Ui_MainWindow
 from PyQt5.QtWidgets import QFileDialog, QMessageBox
 import os
 import serial.tools.list_ports
+from coordinate_transforms import polar_to_cartesian
 
 # Configure logging
 logging.basicConfig(
@@ -33,7 +35,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_COM_PORT = "COM5"
 SOCKET_TIMEOUT = 0.1  # seconds
 BUFFER_SIZE = 2097152  # bytes
-FRAME_QUEUE_TIMEOUT = 0.5  # seconds
+FRAME_QUEUE_TIMEOUT = 0.1  # seconds
 PACKET_HEADER = (0xA55A).to_bytes(2, byteorder='little', signed=False)
 PACKET_FOOTER = (0xEEAA).to_bytes(2, byteorder='little', signed=False)
 PACKET_SIZE_ZERO = (0x00).to_bytes(2, byteorder='little', signed=False)
@@ -69,8 +71,6 @@ FPGA_CONFIG_PORT = 4096
 # Data Processing Queues
 binary_data_queue = Queue()
 range_doppler_queue = Queue()
-range_angle_queue = Queue()
-range_profile_queue = Queue()
 
 # Default Radar Configuration (updated when config file is loaded)
 num_adc_samples = 256  # Default values
@@ -94,6 +94,8 @@ collector = None
 processor = None
 radar_ctrl = None
 fpga_socket = None
+main_window = None
+plot_rd = None  # Range-doppler plot
 
 def get_available_com_ports() -> List[str]:
     """Get a list of available COM ports."""
@@ -140,25 +142,124 @@ def create_command_packet(command_code: str) -> bytes:
         return b'NULL'
 
 def update_figure() -> None:
-    """Update range profile visualization plot with new data."""
-    global plot_rpl, update_time, plot_widget, ui, radar_params
+    """Update range-angle plots with new data."""
+    global img_rd, update_time, plot_widget, ui, radar_params
+
+    # Calculate time since last update
+    now = time.time()
+    dt = now - update_time
     
-    # Get latest data
-    range_profile_data = range_profile_queue.get()
+    # Track frame timing for smoothness metrics
+    frame_times = getattr(update_figure, 'frame_times', [])
+    if len(frame_times) > 100:  # Keep only the last 100 frame times
+        frame_times.pop(0)
+    frame_times.append(dt)
+    update_figure.frame_times = frame_times
     
-    # Calculate range axis using radar parameters
-    range_resolution = radar_params.range_resolution if radar_params else 0.0488
-    range_axis = np.arange(len(range_profile_data)) * range_resolution
+    # Calculate frame time statistics for adaptive timing
+    if len(frame_times) > 10:
+        avg_frame_time = sum(frame_times[-10:]) / 10
+        frame_time_std = np.std(frame_times[-10:])
+        jitter = frame_time_std / avg_frame_time if avg_frame_time > 0 else 0
+        # Log frame timing stats occasionally
+        if getattr(update_figure, 'frame_count', 0) % 100 == 0:
+            logger.debug(f"Frame timing: avg={avg_frame_time*1000:.1f}ms, jitter={jitter*100:.1f}%")
+    else:
+        jitter = 0
     
-    # Update selected channel range profile
-    # Average across chirps for the selected channel
-    profile_data_selected = range_profile_data[:, 0, :]  # Select first channel
-    profile_power = np.mean(np.abs(profile_data_selected) ** 2, axis=1)  # Average across chirps
-    profile_data_db = 10 * np.log10(profile_power / np.max(profile_power) + 1e-10)
-    plot_rpl.setData(range_axis, profile_data_db)
+    # Increment frame counter
+    update_figure.frame_count = getattr(update_figure, 'frame_count', 0) + 1
     
-    QtCore.QTimer.singleShot(1, update_figure)
-    update_time = ptime.time()
+    # Use non-blocking queue gets with short timeout to prevent UI freezing
+    try:
+        # Try to get range data with a short timeout
+        try:
+            range_azimuth, range_axis, azimuth_angles, azimuth_points = range_doppler_queue.get(timeout=0.01)
+            update_figure.last_range_data = (range_azimuth, range_axis, azimuth_angles, azimuth_points)
+        except Empty:
+            # Use the last known data if available
+            if hasattr(update_figure, 'last_range_data'):
+                range_azimuth, range_axis, azimuth_angles, azimuth_points = update_figure.last_range_data
+            else:
+                # Skip this update if no data is available yet
+                logger.debug("No range data available yet")
+                schedule_next_update(jitter)
+                return
+        
+        # Process range data with error handling
+        try:
+            # Convert polar coordinates to Cartesian for Range-Azimuth
+            cartesian_map, x_axis, z_axis = polar_to_cartesian(range_azimuth, range_axis, azimuth_angles)
+            
+            # Transpose data for correct orientation
+            range_azimuth_t = range_azimuth.T
+            cartesian_map_t = cartesian_map.T
+            
+            # Normalize the data
+            max_val = np.max(cartesian_map_t)
+            if max_val > 0:
+                cartesian_map_norm = cartesian_map_t / max_val
+            else:
+                cartesian_map_norm = cartesian_map_t
+            
+            # Update range-azimuth plot
+            if img_rd.image is None:
+                img_rd.setImage(cartesian_map_norm)
+                # Set the rectangle for proper axis scaling
+                x_range = x_axis[-1] - x_axis[0]
+                z_range = z_axis[-1] - z_axis[0]
+                img_rd.setRect(QtCore.QRectF(x_axis[0], z_axis[0], x_range, z_range))
+                
+                # Update axis labels for Cartesian coordinates
+                plot_rd.setLabel('left', 'Z', units='m')
+                plot_rd.setLabel('bottom', 'X', units='m')
+            else:
+                img_rd.updateImage(cartesian_map_norm)
+
+            # Update data display table with detected azimuth points
+            ui.data_display_table.setRowCount(0)  # Clear existing rows
+            if azimuth_points:
+                # Sort points by range
+                azimuth_points = sorted(azimuth_points, key=lambda x: x[0])
+                
+                # Add rows to table
+                for range_val, angle, magnitude in azimuth_points:
+                    row_position = ui.data_display_table.rowCount()
+                    ui.data_display_table.insertRow(row_position)
+                    
+                    # Create and set items
+                    range_item = QtWidgets.QTableWidgetItem(f"{range_val:.2f}")
+                    angle_item = QtWidgets.QTableWidgetItem(f"{angle:.2f}")
+                    
+                    # Center align all items
+                    for item in [range_item, angle_item]:
+                        item.setTextAlignment(QtCore.Qt.AlignCenter)
+                    
+                    # Set items in table
+                    ui.data_display_table.setItem(row_position, 0, range_item)
+                    ui.data_display_table.setItem(row_position, 1, angle_item)
+                    
+        except Exception as e:
+            logger.error(f"Error updating range plots: {e}")
+            
+    except Exception as e:
+        logger.error(f"Error in update_figure: {e}")
+        schedule_next_update(jitter)
+        return
+        
+    # Schedule next update with adaptive timing
+    schedule_next_update(jitter)
+    update_time = now
+
+def schedule_next_update(jitter: float = 0):
+    """Schedule the next UI update with fixed timing."""
+    global update_time
+    
+    # Use a fixed update interval of 100ms (10 FPS)
+    fixed_interval = 100  # milliseconds
+    
+    # Schedule the next update
+    QtCore.QTimer.singleShot(fixed_interval, update_figure)
 
 def initialize_radar() -> None:
     """Initialize and start radar data collection."""
@@ -197,7 +298,7 @@ def initialize_radar() -> None:
     num_rx_channels = radar_params.num_rx_channels
     
     radar_config = [num_adc_samples, num_chirps, num_tx_channels, num_rx_channels]
-    frame_length = int(radar_params.radar_cube_size * 1024)
+    frame_length = num_adc_samples * num_chirps * num_tx_channels * num_rx_channels * 2
     
     # Initialize radar
     radar_ctrl = SerialConfig(name='ConnectRadar', CLIPort=com_port, BaudRate=115200)
@@ -208,7 +309,6 @@ def initialize_radar() -> None:
     time.sleep(1)
     radar_ctrl.StartRadar()
     logger.info("Radar started and streaming data...")
-    
     
     update_figure()
 
@@ -225,16 +325,21 @@ def cleanup() -> None:
         except Exception as e:
             logger.error(f"Error stopping radar: {e}")
     
-    # Stop threads
+    # Stop threads with proper cleanup
     for thread, name in [(collector, "Collector"), (processor, "Processor")]:
         if thread and thread.is_alive():
             try:
                 thread.stop()
-                thread.join(timeout=2)
+                thread.join(timeout=1)
                 if thread.is_alive():
-                    logger.warning(f"{name} thread did not stop gracefully")
-                else:
-                    logger.info(f"{name} thread stopped successfully")
+                    logger.warning(f"{name} thread taking longer to stop, waiting...")
+                    thread.join(timeout=3)
+                    if thread.is_alive():
+                        logger.warning(f"{name} thread did not stop gracefully")
+                    else:
+                        logger.info(f"{name} thread stopped successfully")
+            except AttributeError as e:
+                logger.error(f"Error stopping {name} thread: Missing stop method")
             except Exception as e:
                 logger.error(f"Error stopping {name} thread: {e}")
     
@@ -248,7 +353,7 @@ def cleanup() -> None:
             logger.error(f"Error closing config socket: {e}")
     
     # Clear queues
-    for queue in [binary_data_queue, range_doppler_queue, range_angle_queue, range_profile_queue]:
+    for queue in [binary_data_queue, range_doppler_queue]:
         try:
             while not queue.empty():
                 queue.get_nowait()
@@ -259,8 +364,8 @@ def cleanup() -> None:
 
 def initialize_gui() -> None:
     """Initialize and run the main application window."""
-    global plot_rpl, update_time, collector, processor, fpga_socket
-    global radar_ctrl, plot_widget, ui
+    global plot_rd, img_rd, update_time, collector, processor, fpga_socket
+    global radar_ctrl, plot_widget, ui, main_window
     
     app = QtWidgets.QApplication(sys.argv)
     main_window = QtWidgets.QMainWindow()
@@ -275,6 +380,7 @@ def initialize_gui() -> None:
         sys.exit()
     
     main_window.closeEvent = handle_close
+    main_window.setWindowState(QtCore.Qt.WindowMaximized)
     main_window.show()
     
     # Initialize buttons
@@ -288,42 +394,109 @@ def initialize_gui() -> None:
     if com5_index >= 0:
         ui.com_select.setCurrentIndex(com5_index)
     
+    # Setup range-angle plot with black background
+    view_rd = ui.range_angle_view.addViewBox()
+    view_rd.setAspectLocked(True)
+    plot_rd = pg.PlotItem()
+    ui.range_angle_view.setCentralItem(plot_rd)
     
-    # Setup range profile plot
-    view_rpl = ui.range_profile_view.addViewBox()
-    view_rpl.setAspectLocked(False)
-    plot_widget = pg.PlotItem(viewBox=view_rpl)
+    # Configure plot appearance
+    plot_rd.showGrid(x=True, y=True)
+    plot_rd.getAxis('left').setPen(pg.mkPen(color='w', width=1))
+    plot_rd.getAxis('bottom').setPen(pg.mkPen(color='w', width=1))
+    plot_rd.getAxis('left').setTextPen(pg.mkPen(color='w', width=1))
+    plot_rd.getAxis('bottom').setTextPen(pg.mkPen(color='w', width=1))
+    max_range = radar_params.max_range if radar_params else 10
     
-    # Configure range profile plot
-    ui.range_profile_view.setCentralItem(plot_widget)
-    plot_widget.setLabel('left', 'Magnitude', units='dB')
-    plot_widget.setLabel('bottom', 'Range', units='m')
-    plot_widget.showGrid(x=True, y=True)
-    plot_rpl = plot_widget.plot(pen='y')
+    # Set axis ranges for Cartesian display
+    plot_rd.setYRange(0, max_range)  # Z-axis (range)
+    plot_rd.setXRange(-max_range, max_range)  # X-axis (cross-range)
     
-    update_time = ptime.time()
-
-    # Load default config
-    default_config = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                 '..', 'config', 'IWR1843_cfg.cfg')
-    if os.path.exists(default_config):
+    # Configure axis labels for Cartesian coordinates
+    plot_rd.setLabel('left', 'Z', units='m')  # Range
+    plot_rd.setLabel('bottom', 'X', units='m')  # Cross-range
+    
+    # Create and configure range-doppler image item with OpenGL acceleration
+    img_rd = pg.ImageItem(useOpenGL=True)
+    plot_rd.addItem(img_rd)
+    
+    # Create viridis colormap
+    colormap = plt.cm.viridis
+    colors = [tuple(int(x * 255) for x in colormap(i)[:3]) for i in np.linspace(0, 1, 256)]
+    pos = np.linspace(0, 1, len(colors))
+    color_map = pg.ColorMap(pos, colors)
+    lut = color_map.getLookupTable()
+    img_rd.setLookupTable(lut)
+    
+    update_time = time.time()
+    
+    # Try to load default config and update UI
+    if load_default_config() and ui:
         ui.config_path.setText(os.path.basename(default_config))
         ui.config_path.setProperty("fullPath", default_config)
-        radar_params = RadarParameters(default_config)
     
     # Connect buttons
     ui.browse_button.clicked.connect(browse_config)
     start_button.clicked.connect(initialize_radar)
     exit_button.clicked.connect(lambda: (cleanup(), app.quit(), sys.exit()))
     
-    # Connect channel selection
-    def on_channel_changed(button):
+    # Connect window and padding selection dropdowns
+    def on_window_changed(window_type):
         if processor:
-            channel_id = ui.channel_group.id(button)
-            processor.set_channel(channel_id)
-            logger.info(f"Selected channel changed to {channel_id}")
+            processor.set_window_type(window_type)
+            logger.info(f"Window type changed to {window_type}")
     
-    ui.channel_group.buttonClicked.connect(on_channel_changed)
+    def on_range_padding_changed(padding_size):
+        if processor:
+            processor.set_range_padding(int(padding_size))
+            logger.info(f"Range padding changed to {padding_size}")
+            
+    def on_doppler_padding_changed(padding_size):
+        if processor:
+            processor.set_doppler_padding(int(padding_size))
+            logger.info(f"Doppler padding changed to {padding_size}")
+            
+    def on_angle_padding_changed(padding_size):
+        if processor:
+            processor.set_angle_padding(int(padding_size))
+            logger.info(f"Angle padding changed to {padding_size}")
+    
+    ui.window_select.currentTextChanged.connect(on_window_changed)
+    ui.range_pad_select.currentTextChanged.connect(on_range_padding_changed)
+    ui.doppler_pad_select.currentTextChanged.connect(on_doppler_padding_changed)
+    ui.angle_pad_select.currentTextChanged.connect(on_angle_padding_changed)
+    
+    # Connect static clutter removal button
+    def on_clutter_removal_changed(checked):
+        if processor:
+            processor.set_clutter_removal(checked)
+    
+    ui.remove_clutter_button.toggled.connect(on_clutter_removal_changed)
+    
+    # Connect CFAR parameter controls
+    def on_guard_cells_changed(value):
+        if processor:
+            # Use the same guard cells for both range and doppler dimensions
+            processor.set_cfar_params(range_guard_cells=value, doppler_guard_cells=value)
+            
+    def on_training_cells_changed(value):
+        if processor:
+            # Use the same training cells for both range and doppler dimensions
+            processor.set_cfar_params(range_training_cells=value, doppler_training_cells=value)
+            
+    def on_false_alarm_changed(value):
+        if processor:
+            processor.set_cfar_params(pfa=value)
+            
+    def on_group_peaks_changed(checked):
+        if processor:
+            processor.set_cfar_params(group_peaks=checked)
+    
+    # Connect CFAR spinboxes
+    ui.guard_cells_spin.valueChanged.connect(on_guard_cells_changed)
+    ui.training_cells_spin.valueChanged.connect(on_training_cells_changed)
+    ui.false_alarm_spin.valueChanged.connect(on_false_alarm_changed)
+    ui.group_peaks_button.toggled.connect(on_group_peaks_changed)
     
     app.instance().exec_()
 
@@ -332,7 +505,6 @@ def initialize_fpga() -> socket.socket:
     command_sequence = ['9', 'E', '3', 'B', '5', '6']
     
     try:
-        # Create socket
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         
@@ -340,7 +512,6 @@ def initialize_fpga() -> socket.socket:
             sock.bind(config_address)
         except OSError as e:
             logger.error(f"Failed to bind socket: {e}")
-            # Cleanup existing sockets
             try:
                 import psutil
                 current_pid = os.getpid()
@@ -362,7 +533,6 @@ def initialize_fpga() -> socket.socket:
                 logger.error(f"Could not bind socket: {bind_error}")
                 raise
         
-        # Configure FPGA
         for command in command_sequence[:5]:
             sock.sendto(create_command_packet(command), fpga_address)
             try:
@@ -382,11 +552,29 @@ def initialize_fpga() -> socket.socket:
 # Initialize system
 fpga_socket = initialize_fpga()
 
+# Define default config path
+default_config = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             '..', 'config', 'AWR1843_cfg.cfg')
+
+def load_default_config():
+    """Load default radar configuration file."""
+    global radar_params
+    if os.path.exists(default_config):
+        radar_params = RadarParameters(default_config)
+        logger.info("Loaded default radar parameters")
+        return True
+    else:
+        logger.warning("Default config file not found")
+        return False
+
 # Start data collection
+if not radar_params and not load_default_config():
+    logger.warning("No radar parameters available. Processing will use defaults.")
+
 collector = UdpListener('Listener', binary_data_queue, frame_length, data_address, BUFFER_SIZE)
 processor = DataProcessor('Processor', radar_config, binary_data_queue,
-                        range_doppler_queue, range_angle_queue, range_profile_queue,
-                        selected_channel=0)  # Start with first channel
+                        range_doppler_queue, None, None,
+                        selected_channel=0, radar_params=radar_params)
 collector.start()
 processor.start()
 
