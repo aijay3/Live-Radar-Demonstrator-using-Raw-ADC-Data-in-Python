@@ -269,11 +269,3 @@ The project is organized into three main components:
 * Channel selection for detailed analysis
 * Configuration file management
 
-
-
-  doi={10.1109/VTC2020-Spring48590.2020.9128573}
-}
-```
-
-## Demo Video
-[Watch the demo video on YouTube](https://youtu.be/Z6rTQDMe6a4)
