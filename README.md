@@ -74,7 +74,7 @@ pip install -r requirements.txt
 
 ### Connecting the Hardware
 
-1. Connect the XWR1843 EVM to the DCA1000 EVM using the MMWAVEICBOOST adapter board.
+1. Connect the XWR1843 EVM to the DCA1000 EVM.
 2. Connect the DCA1000 EVM to your computer using an Ethernet cable.
 3. Connect the XWR1843 EVM to your computer using a USB cable for serial configuration.
 
