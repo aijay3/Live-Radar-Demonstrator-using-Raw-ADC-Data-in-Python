@@ -1,0 +1,21 @@
+name: real-time-radar
+channels:
+  - defaults
+dependencies:
+  - python=3.8
+  - pip
+  - pip:
+    - numpy==1.18.5
+    - matplotlib==3.2.2
+    - PyQt5==5.15.1
+    - PyQt5-sip==12.8.1
+    - pyqtgraph==0.11.0
+    - pyserial==3.4
+    - scipy==1.4.1
+    - pyfftw==0.13.1
+    - psutil==5.9.5
+    - cycler==0.10.0
+    - kiwisolver==1.2.0
+    - pyparsing==2.4.7
+    - python-dateutil==2.8.1
+    - six==1.15.0
