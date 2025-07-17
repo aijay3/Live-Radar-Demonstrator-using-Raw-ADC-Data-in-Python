@@ -2,8 +2,6 @@
 
 This is a real-time ADC sample capture and processing tool to obtain and analyze raw data from TI mmWave radar ***XWR1843 EVM*** cascading with ***DCA1000 EVM*** using Python. The tool enables real-time processing to generate Range Profile, Range-Doppler, and Range-Angle images under 1 Transmitter and 4 Receiver (in this version) setting without using mmWave studio.
 
-![Demo](Demo.PNG)
-
 ## Table of Contents
 - [Hardware Requirements](#hardware-requirements)
 - [Software Requirements](#software-requirements)
