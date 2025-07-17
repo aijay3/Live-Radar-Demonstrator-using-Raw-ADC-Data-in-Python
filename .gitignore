@@ -28,3 +28,21 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Documentation files
+Abstract.md
+Appendix.md
+Applications_and_Significance_Report.md
+Challenges_and_Solutions_Report.md
+Comprehensive_Real_Time_Radar_Guide.md
+Declaration_of_Authorship.md
+Documentation_Index.md
+Limitations_and_Constraints_Report.md
+Performance_Analysis_Report.md
+Quick_Reference_Guide.md
+Setup_and_Installation_Guide.md
+Software_Features_Report.md
+System_Architecture_Overview.md
+
+# Keep README.md as it's essential for project setup
+# Keep Demo.PNG as it might be referenced in README
